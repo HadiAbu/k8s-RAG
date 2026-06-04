@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific — large data dirs
+data/raw/
+storage/faiss/
+storage/sqlite/
+evaluation_results.json

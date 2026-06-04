@@ -1,0 +1,98 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker compose up
+#
+# Start order:
+#   1. ollama        — LLM backend (waits until /api/tags responds)
+#   2. model-pull    — pulls the configured model into Ollama (runs once, exits)
+#   3. api           — builds the RAG index on first run, then serves requests
+#
+# First-run sequence (approx. times on a modern laptop, CPU only):
+#   • Ollama model pull  — 5–15 min  (qwen3:8b ≈ 5 GB)
+#   • k8s docs clone     — 2–5 min   (kubernetes/website ≈ 1 GB)
+#   • Embedding pipeline — 15–30 min (CPU, no GPU)
+#
+# Re-runs are fast: model + index are stored in named volumes and reused.
+#
+# Override the LLM model without editing this file:
+#   LLM_MODEL=phi4-mini docker compose up
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Ollama LLM backend ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 12          # up to 2 min for Ollama cold start
+      start_period: 20s
+
+  # ── Pull LLM model into Ollama (one-shot, exits 0 when done) ───────────────
+  # Re-running `docker compose up` is safe: Ollama skips re-downloading a
+  # model that is already present.
+  model-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      LLM_MODEL: ${LLM_MODEL:-qwen3:8b}
+    entrypoint: >
+      sh -c 'echo "Pulling model: $$LLM_MODEL ..." &&
+             ollama pull "$$LLM_MODEL" &&
+             echo "Model ready."'
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: "no"
+
+  # ── RAG API ─────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      args:
+        EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+        RERANKER_MODEL:  ${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the cloned k8s docs and index across restarts
+      - k8s_docs:/app/data
+      - rag_index:/app/storage
+    environment:
+      # LLM
+      K8S_RAG_LLM_BACKEND:  openai_compatible
+      K8S_RAG_LLM_BASE_URL: http://ollama:11434/v1
+      K8S_RAG_LLM_MODEL:    ${LLM_MODEL:-qwen3:8b}
+      K8S_RAG_LLM_API_KEY:  ollama
+      # Embeddings
+      K8S_RAG_EMBEDDING_MODEL:  ${EMBEDDING_MODEL:-BAAI/bge-small-en-v1.5}
+      K8S_RAG_EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      # Model cache (matches baked-in paths)
+      HF_HOME: /app/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /app/.cache/sentence_transformers
+    depends_on:
+      ollama:
+        condition: service_healthy
+      model-pull:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # start_period gives the entrypoint time to clone + index k8s docs on first run
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 2400s   # 40 min — covers worst-case first-run index build
+
+volumes:
+  ollama_models:   # Ollama model weights
+  k8s_docs:        # kubernetes/website clone
+  rag_index:       # FAISS index + SQLite database
